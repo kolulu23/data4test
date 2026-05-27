@@ -6,6 +6,7 @@ import (
 	"runtime/debug"
 	"strconv"
 	"time"
+	_ "unsafe"
 
 	//"encoding/json"
 	"errors"
@@ -28,6 +29,7 @@ import (
 	//_ "net/http/pprof"
 
 	ada "github.com/GoAdminGroup/go-admin/adapter/gin"
+	gconfig "github.com/GoAdminGroup/go-admin/modules/config"
 	_ "github.com/GoAdminGroup/go-admin/modules/db/drivers/mysql" // sql driver
 	_ "github.com/GoAdminGroup/go-admin/modules/db/drivers/sqlite"
 	"github.com/GoAdminGroup/go-admin/plugins"
@@ -49,6 +51,9 @@ import (
 	plugModels "github.com/GoAdminGroup/go-admin/plugins/admin/models"
 	"github.com/GoAdminGroup/librarian"
 )
+
+//go:linkname goadminGlobal github.com/GoAdminGroup/go-admin/modules/config._global
+var goadminGlobal *gconfig.Config
 
 type Args struct {
 	Config string
@@ -91,6 +96,125 @@ func main() {
 	startServer()
 }
 
+func preprocessSessionConfig(configPath string) string {
+	data, err := ioutil.ReadFile(configPath)
+	if err != nil {
+		return configPath
+	}
+	var configMap map[string]interface{}
+	if err := json.Unmarshal(data, &configMap); err != nil {
+		return configPath
+	}
+	sessionLifeTime, ok := configMap["session_life_time"].(float64)
+	if !ok || sessionLifeTime != 0 {
+		return configPath
+	}
+	configMap["session_life_time"] = 315360000
+	modified, err := json.Marshal(configMap)
+	if err != nil {
+		return configPath
+	}
+	tmpFile, err := ioutil.TempFile("", "data4test-session-config-*.json")
+	if err != nil {
+		return configPath
+	}
+	if _, err := tmpFile.Write(modified); err != nil {
+		tmpFile.Close()
+		return configPath
+	}
+	tmpFile.Close()
+	return tmpFile.Name()
+}
+
+const sessionNeverExpire = 315360000
+
+func persistSessionLifeTime(configPath string, newValue int) error {
+	data, err := ioutil.ReadFile(configPath)
+	if err != nil {
+		return err
+	}
+	var configMap map[string]interface{}
+	if err := json.Unmarshal(data, &configMap); err != nil {
+		return err
+	}
+	configMap["session_life_time"] = newValue
+	modified, err := json.MarshalIndent(configMap, "", "\t")
+	if err != nil {
+		return err
+	}
+	return ioutil.WriteFile(configPath, modified, 0644)
+}
+
+func handleSessionConfig(ctx *context.Context) {
+	user := auth.Auth(ctx)
+	if len(user.Roles) == 0 || user.Roles[0].Name != "Administrator" {
+		ctx.JSON(http.StatusForbidden, map[string]interface{}{
+			"code": 403,
+			"msg":  "仅管理员可操作",
+		})
+		return
+	}
+
+	if ctx.Method() == "GET" {
+		ctx.JSON(http.StatusOK, map[string]interface{}{
+			"code": 200,
+			"data": map[string]interface{}{
+				"session_life_time": gconfig.GetSessionLifeTime(),
+			},
+		})
+		return
+	}
+
+	if ctx.Method() == "POST" {
+		body, _ := ioutil.ReadAll(ctx.Request.Body)
+		var req struct {
+			SessionLifeTime int `json:"session_life_time"`
+		}
+		if err := json.Unmarshal(body, &req); err != nil {
+			ctx.JSON(http.StatusBadRequest, map[string]interface{}{
+				"code": 400,
+				"msg":  "无效的请求体",
+			})
+			return
+		}
+
+		if req.SessionLifeTime < 0 || req.SessionLifeTime > sessionNeverExpire {
+			ctx.JSON(http.StatusBadRequest, map[string]interface{}{
+				"code": 400,
+				"msg":  fmt.Sprintf("session_life_time 必须在 0 到 %d 之间（0=永不超时）", sessionNeverExpire),
+			})
+			return
+		}
+
+		effectiveValue := req.SessionLifeTime
+		if effectiveValue == 0 {
+			effectiveValue = sessionNeverExpire
+		}
+
+		if goadminGlobal != nil {
+			goadminGlobal.SessionLifeTime = effectiveValue
+		}
+
+		if err := persistSessionLifeTime(args.Config, req.SessionLifeTime); err != nil {
+			ctx.JSON(http.StatusInternalServerError, map[string]interface{}{
+				"code": 500,
+				"msg":  fmt.Sprintf("保存配置文件失败: %s", err),
+			})
+			return
+		}
+
+		ctx.JSON(http.StatusOK, map[string]interface{}{
+			"code": 200,
+			"msg":  "更新成功",
+			"data": map[string]interface{}{
+				"effective_value": effectiveValue,
+				"config_value":    req.SessionLifeTime,
+			},
+		})
+		return
+	}
+}
+
 func startServer() {
 	gin.SetMode(gin.ReleaseMode)
 	gin.DefaultWriter = ioutil.Discard
@@ -105,7 +229,9 @@ func startServer() {
 	template.AddLoginComp(login.Get())
 	template.AddComp(chartjs.NewChart())
 
-	if err := eng.AddConfigFromJSON(args.Config).
+	configPath := preprocessSessionConfig(args.Config)
+
+	if err := eng.AddConfigFromJSON(configPath).
 		AddGenerators(tables.Generators).
 		AddPlugins(librarian.NewLibrarianWithConfig(librarian.Config{
 			Path:           biz.DocFilePath,
@@ -1836,6 +1962,9 @@ func startServer() {
 			})
 		}
 	})
+
+	eng.Data("GET", "/admin/api/session_config", handleSessionConfig)
+	eng.Data("POST", "/admin/api/session_config", handleSessionConfig)
 
 	models.Init(eng.MysqlConnection())
 	biz.Init()

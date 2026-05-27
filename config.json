@@ -35,6 +35,8 @@
 	"error_log": "./mgmt/log/error.log",
 	"access_log": "./mgmt/log/access.log",
 	"session_life_time": 7200,
+	"_comment_session": "session_life_time in seconds. Set to 0 to disable session timeout (never expire).",
+	"domain": "",
 	"file_upload_engine": {
 		"name": "local"
 	},
